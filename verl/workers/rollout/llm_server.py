@@ -236,6 +236,7 @@ class LLMServerClient:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        escalation_key: Optional[str] = None,
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -244,6 +245,10 @@ class LLMServerClient:
             request_id (str): request id for sticky session.
             prompt_ids (List[int]): List of prompt token ids.
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            escalation_key (Optional[str]): ``uid_session`` label used by the
+                mismatch-driven precision-escalation control layer to attribute
+                rollbacks. Consumed by subclasses that track in-flight prefixes;
+                never forwarded to the server.
 
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
@@ -303,6 +308,39 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         """
         super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
         self._only_hybrid = only_hybrid
+        # In-flight partial-rollout state, keyed by request_id. Each entry holds
+        # the prompt and a reference to the generate()'s accumulating final_output
+        # so the trainer can read the produced prefix (and its rollout logprobs)
+        # at weight-sync time. _truncations holds rollback points dispatched by
+        # the trainer; each is consumed once by the matching in-flight generate.
+        self._inflight: dict[str, dict] = {}
+        self._truncations: dict[str, int] = {}
+
+    def _apply_truncation(self, request_id: str) -> None:
+        """Consume this request's rollback point, if one was dispatched.
+
+        The trainer computes rollback points during the weight-sync window, when
+        replicas are asleep and the client is blocked in ``_acquire_server``, so
+        applying here (right before each resubmission) guarantees the first
+        request served after resume already carries the truncated prefix.
+        """
+        info = self._inflight.get(request_id)
+        if info is None:
+            return
+        b = self._truncations.pop(request_id, None)
+        if b is None:
+            return
+        final_output = info["final_output"]
+        final_output.token_ids = final_output.token_ids[:b]
+        # No falsy guard: truncate log_probs unconditionally so the prefix keeps
+        # len(log_probs) == len(token_ids) after rollback (a log_probs list left
+        # untouched here can desync the trajectory's rollout_log_probs length).
+        final_output.log_probs = final_output.log_probs[:b]
+        # Restore the full remaining budget for the resumed generation; the
+        # stale decrement was computed against the pre-truncation length.
+        limit_key = info["limit_key"]
+        if limit_key is not None:
+            info["sampling_params"][limit_key] = info["original_max_tokens"] - b
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -311,6 +349,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # In that case keep retrying every 1 s until a server becomes available.
         # Otherwise raise immediately so callers see the error right away.
         while True:
+            # Apply any rollback point dispatched since the last attempt so the
+            # resume (prompt + final_output.token_ids) starts from the truncated
+            # prefix, not the stale one the last abort interrupted.
+            self._apply_truncation(request_id)
             try:
                 return await super()._acquire_server(request_id)
             except RuntimeError as e:
@@ -330,6 +372,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        seed_token_ids: Optional[list[int]] = None,
+        seed_log_probs: Optional[list[float]] = None,
+        seed_is_complete: bool = False,
+        seed_global_steps: Optional[int] = None,
+        escalation_key: Optional[str] = None,
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -342,6 +389,19 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             video_data (Optional[List[Any]]): Video data for the chat completion.
             audio_data (Optional[List[Any]]): Audio data for the chat completion.
             mm_processor_kwargs (Optional[Dict[str, Any]]): Multimodal processor kwargs.
+            escalation_key (Optional[str]): ``uid_session`` label surfaced through
+                ``get_inflight_prefixes`` so the mismatch-driven precision
+                escalation layer can attribute rollbacks to a prompt group.
+            seed_token_ids (Optional[List[int]]): Already-generated response prefix to keep.
+                The request resumes from this prefix instead of generating from scratch, so
+                a rolled-back trajectory's continuation is attached after the kept tokens.
+                Only used by the FullyAsync partial-rollout resume path.
+            seed_log_probs (Optional[List[float]]): Rollout logprobs aligned with
+                ``seed_token_ids`` (produced by the model version that generated them).
+            seed_is_complete (bool): Return the seed verbatim without generating. Used by
+                the trainer to re-insert unchanged (clean) sessions of a rolled-back group.
+            seed_global_steps (Optional[int]): global_steps stamped on the returned output
+                when ``seed_is_complete`` skips the server round-trip.
 
         Returns:
             TokenOutput: token output
@@ -356,11 +416,45 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         original_max_tokens = sampling_params.get(limit_key) if limit_key else None
 
         final_output = TokenOutput(
-            token_ids=[],
-            log_probs=[],
+            token_ids=list(seed_token_ids) if seed_token_ids else [],
+            log_probs=list(seed_log_probs) if seed_log_probs else [],
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
+
+        if seed_is_complete:
+            # No-op reinsert of a kept-complete trajectory (clean session of a group whose
+            # sibling sessions were rolled back). The seed is returned verbatim; the only
+            # thing lost is a server round-trip, so generation load is unchanged.
+            final_output.stop_reason = "completed"
+            if seed_global_steps is not None:
+                final_output.extra_fields["global_steps"] = seed_global_steps
+                final_output.extra_fields["min_global_steps"] = seed_global_steps
+                final_output.extra_fields["max_global_steps"] = seed_global_steps
+            # The kept prefix was generated by an earlier request whose top-k was never
+            # persisted; emit invalid slots so the trajectory still carries the field
+            # (mixed presence across a batch breaks the TransferQueue field set).
+            sc_topk = int(sampling_params.get("score_centering_topk", 0) or 0)
+            if sc_topk > 0:
+                n_kept = len(final_output.token_ids)
+                final_output.extra_fields["sc_topk_ids"] = [[-1] * sc_topk for _ in range(n_kept)]
+                final_output.extra_fields["sc_topk_logprobs"] = [[0.0] * sc_topk for _ in range(n_kept)]
+            self._inflight.pop(request_id, None)
+            self._truncations.pop(request_id, None)
+            return final_output
+
+        # Expose the in-flight prefix to the trainer (read-only via
+        # get_inflight_prefixes) for mismatch-aware partial rollout. A seeded request
+        # starts with the kept prefix already in final_output, so an abort retry (and a
+        # concurrent weight-sync truncation screen) sees exactly the resumed prefix.
+        self._inflight[request_id] = {
+            "prompt_ids": prompt_ids,
+            "final_output": final_output,
+            "sampling_params": sampling_params,
+            "limit_key": limit_key,
+            "original_max_tokens": original_max_tokens,
+            "escalation_key": escalation_key,
+        }
 
         while True:
             # 1. generate tokens
@@ -376,9 +470,45 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             )
 
             # 2. merge output into final_output
+            # Score Centering: accumulate the sampler's per-position top-k (ids + q
+            # logprobs) across continuation calls, in lockstep with token_ids. A
+            # partial-rollout resume keeps a prefix that carries no top-k of its own, so
+            # backfill those leading rows with invalid slots (-1 id / 0.0 logprob): the
+            # loss masks them out and those positions fall back to plain PG.
+            sc_ids_call = output.extra_fields.get("sc_topk_ids")
+            sc_lps_call = output.extra_fields.get("sc_topk_logprobs")
+            if sc_ids_call is not None and sc_lps_call is not None:
+                acc_ids = final_output.extra_fields.get("sc_topk_ids")
+                acc_lps = final_output.extra_fields.get("sc_topk_logprobs")
+                if acc_ids is None:
+                    width = len(sc_ids_call[0]) if sc_ids_call else 0
+                    n_kept = len(final_output.token_ids)
+                    acc_ids = [[-1] * width for _ in range(n_kept)]
+                    acc_lps = [[0.0] * width for _ in range(n_kept)]
+                acc_ids.extend(sc_ids_call)
+                acc_lps.extend(sc_lps_call)
+                final_output.extra_fields["sc_topk_ids"] = acc_ids
+                final_output.extra_fields["sc_topk_logprobs"] = acc_lps
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
+            # Keep log_probs aligned with token_ids. A per-call payload whose
+            # logprobs outnumber its own tokens (server abort/continuation edge)
+            # would otherwise leave final_output.log_probs longer than
+            # final_output.token_ids and corrupt the trajectory's rollout_log_probs
+            # length, crashing the trainer's loss shape check downstream.
+            if len(final_output.log_probs) > len(final_output.token_ids):
+                logger.warning(
+                    "[client-merge-guard] request=%s clip log_probs %d -> %d "
+                    "(token_ids=%d stop=%s global_steps=%s)",
+                    request_id,
+                    len(final_output.log_probs),
+                    len(final_output.token_ids),
+                    len(final_output.token_ids),
+                    output.stop_reason,
+                    output.extra_fields.get("global_steps"),
+                )
+                final_output.log_probs = final_output.log_probs[: len(final_output.token_ids)]
             # On partial rollout resume the model version may differ, so keep
             # existing routing and only append routing for newly generated tokens.
             if output.routed_experts is not None and len(output.token_ids) > 0:
@@ -417,10 +547,62 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
             await asyncio.sleep(1)
 
+        # A stale truncation point (request completed without an abort retry)
+        # must not leak into a later generate reusing this request_id.
+        self._truncations.pop(request_id, None)
+        self._inflight.pop(request_id, None)
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
+
+        # Keep the accumulated top-k aligned with the final token length, mirroring the
+        # log_probs length guard in the merge loop. Trim over-long rows; pad short ones
+        # with invalid slots so the response axis stays aligned downstream.
+        sc_ids = final_output.extra_fields.get("sc_topk_ids")
+        sc_lps = final_output.extra_fields.get("sc_topk_logprobs")
+        if sc_ids is not None and sc_lps is not None and len(sc_ids) != len(final_output.token_ids):
+            n = len(final_output.token_ids)
+            width = len(sc_ids[0]) if sc_ids else int(sampling_params.get("score_centering_topk", 0) or 0)
+            sc_ids = sc_ids[:n]
+            sc_lps = sc_lps[:n]
+            pad = n - len(sc_ids)
+            if pad > 0:
+                sc_ids = sc_ids + [[-1] * width for _ in range(pad)]
+                sc_lps = sc_lps + [[0.0] * width for _ in range(pad)]
+            final_output.extra_fields["sc_topk_ids"] = sc_ids
+            final_output.extra_fields["sc_topk_logprobs"] = sc_lps
         return final_output
+
+    def get_inflight_prefixes(self) -> list[dict[str, Any]]:
+        """Return partial-rollout prefixes of unfinished generate calls.
+
+        Each entry is ``{"request_id", "prompt_ids", "response_prefix",
+        "rollout_log_probs", "escalation_key"}`` for a generate that has produced
+        at least one token and is still in flight. Read at weight-sync time so the
+        trainer can compute the new model's prefix logprobs and roll back mismatch
+        tokens.
+        """
+        prefixes = []
+        for request_id, info in self._inflight.items():
+            final_output = info["final_output"]
+            if len(final_output.token_ids) < 1:
+                continue
+            prefixes.append(
+                {
+                    "request_id": request_id,
+                    "prompt_ids": info["prompt_ids"],
+                    "response_prefix": list(final_output.token_ids),
+                    "rollout_log_probs": list(final_output.log_probs),
+                    "escalation_key": info.get("escalation_key"),
+                }
+            )
+        return prefixes
+
+    def set_truncation_points(self, truncations: dict[str, int]) -> None:
+        """Record per-request rollback points (response-token index) computed by
+        the trainer at the last weight sync. Each is consumed once by the
+        matching in-flight generate on its next retry."""
+        self._truncations.update(truncations)
 
 
 class LLMServerManager:
@@ -557,6 +739,30 @@ class LLMServerManager:
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
         )
+
+    @auto_await
+    async def relaunch_replicas(self) -> None:
+        """Recreate the server replicas from the current ``rollout_config``.
+
+        Used by the precision switch: the caller tears the old servers down first
+        (see ``RolloutReplica.teardown_servers``), mutates the precision fields of
+        ``rollout_config``, then calls this to build servers with the new precision.
+        ``self.server_addresses`` / ``self.server_handles`` are refreshed.
+        """
+        await self._initialize_llm_servers()
+
+    @auto_await
+    async def swap_servers(self, old_addresses: list[str]) -> None:
+        """Replace ``old_addresses`` with the freshly launched servers in the load balancer.
+
+        The sticky-session cache is cleared so subsequent requests are balanced
+        over the new (least-loaded) servers instead of being pinned to a stale,
+        now-dead one.
+        """
+        new_servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
+        await self.global_load_balancer.remove_servers.remote(old_addresses)
+        await self.global_load_balancer.add_servers.remote(new_servers)
+        await self.global_load_balancer.clear_sticky_cache.remote()
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.

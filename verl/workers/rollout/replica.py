@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -127,6 +128,9 @@ class RolloutReplica(ABC):
         self.servers: list[ActorHandle] = []
         self._server_address: str = None
         self._server_handle: ActorHandle = None
+        # Names of the server actors created by launch_servers(), used to wait for
+        # the names to be released after teardown before relaunching.
+        self._server_names: list[str] = []
 
     async def init_hybrid(self, worker_group: RayWorkerGroup):
         """Init hybrid rollout server, rollout engine and training engine(fsdp/megatron) fused in same process.
@@ -289,6 +293,35 @@ class RolloutReplica(ABC):
     async def resume_kv_cache(self):
         """Restore the kv_cache GPU memory after a weight sync."""
         await asyncio.gather(*[server.resume_kv_cache.remote() for server in self.servers])
+
+    def teardown_servers(self, timeout_s: float = 120.0) -> None:
+        """Kill this replica's server actors so ``launch_servers()`` can recreate them.
+
+        The engine's precision (and its KV-cache dtype) is fixed when the server is
+        built, so switching precision means tearing the servers down and launching
+        them again with a modified config. Only valid while the replica is asleep and
+        no requests are in flight; the caller must guarantee that.
+
+        Blocks until the named actors disappear, because ``launch_servers()``
+        re-creates them under the same names and Ray rejects a duplicate name.
+        """
+        for server in self.servers:
+            ray.kill(server, no_restart=True)
+        self.servers = []
+        self._server_handle = None
+        self._server_address = None
+
+        deadline = time.time() + timeout_s
+        for name in self._server_names:
+            while True:
+                try:
+                    ray.get_actor(name)
+                except ValueError:
+                    break
+                if time.time() > deadline:
+                    raise TimeoutError(f"rollout server actor {name!r} did not terminate within {timeout_s}s")
+                time.sleep(0.5)
+        self._server_names = []
 
     async def start_profile(self, **kwargs):
         """Start profiling on the replica."""

@@ -28,6 +28,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS", "60"))
 
+# Starved-pool self-heal (ReplayBufferAsync.sample): after this many consecutive
+# polls with no in-flight requests and an unfillable batch, dispatch a fresh
+# gen-batch to rebuild the pool instead of polling forever. Bounded by
+# VERL_REPLAY_BUFFER_MAX_GUARD_REFILLS per sample() call so a genuinely broken
+# pipeline crashes loudly (fail-closed) rather than deadlocking silently.
+VERL_REPLAY_BUFFER_STALL_POLL_THRESHOLD = int(os.getenv("VERL_REPLAY_BUFFER_STALL_POLL_THRESHOLD", "30"))
+VERL_REPLAY_BUFFER_MAX_GUARD_REFILLS = int(os.getenv("VERL_REPLAY_BUFFER_MAX_GUARD_REFILLS", "5"))
+
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 
 
@@ -177,6 +185,10 @@ class ReplayBuffer:
         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
+        # Starved-pool self-heal state (ReplayBufferAsync.sample): consecutive polls
+        # with no in-flight requests, and gen-batch refills dispatched so far.
+        self._stall_polls = 0
+        self._guard_refills = 0
 
     def _validate_mode_config(self) -> None:
         if self.filter_groups_metric is not None:
@@ -244,6 +256,19 @@ class ReplayBuffer:
         for uid in uids:
             self.prompt_global_steps[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
+
+    def _precision_drop_keys(self, partition_id: str, exclude_uids: set[str] | None) -> set[str]:
+        """Terminal groups whose uid the caller asked to exclude (precision escalation).
+
+        Only *terminal* groups are returned: an in-flight group's running sessions
+        still write to the queue, so clearing it now would let those writes land on a
+        group the replay buffer no longer tracks. The caller keeps such a uid in its
+        exclusion set and it is dropped here once it settles.
+        """
+        if not exclude_uids or partition_id == "val":
+            return set()
+        terminal = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        return set(exclude_uids) & terminal
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
         """Finished groups whose configured DAPO metric is identical across all trajectories.
@@ -402,7 +427,13 @@ class ReplayBuffer:
         return last_debug_time
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
-    def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
+    def sample(
+        self,
+        global_steps: int,
+        partition_id: str,
+        batch_size: int,
+        exclude_uids: set[str] | None = None,
+    ) -> tuple[KVBatchMeta, dict]:
         """Sample a batch using synchronous rollout semantics.
 
         NOTE: user can customize sampling strategy by setting:
@@ -415,6 +446,9 @@ class ReplayBuffer:
             global_steps (int): Global steps of the current training.
             partition_id (str): Partition of TransferQueue, e.g. "train" or "val".
             batch_size (int, optional): Batch size.
+            exclude_uids (set[str], optional): Uids the caller wants removed before
+                selection (precision-escalation "drop"). Terminal ones are cleared and
+                their slots refilled so the batch stays full.
 
         Returns:
             KVBatchMeta: A batch of data.
@@ -432,6 +466,18 @@ class ReplayBuffer:
         while True:
             # Eviction, gating, and selection below must all use this snapshot.
             self._sync_metadata_from_transfer_queue()
+
+            # Precision-escalation drop: remove excluded terminal groups before they can
+            # be selected, then refill their slots. Handled first so a dropped group is
+            # never counted as a sampleable terminal below.
+            drop_uids = self._precision_drop_keys(partition_id, exclude_uids)
+            if drop_uids:
+                self._clear_groups(partition_id, drop_uids)
+                key = f"{self._metrics_prefix(partition_id)}/precision_drop/dropped_samples"
+                eviction_metrics[key] = eviction_metrics.get(key, 0) + len(drop_uids)
+                if self.refill_fn is not None:
+                    self.refill_fn(len(drop_uids))
+                continue
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
             failed_count = len(eviction_reasons[2])
@@ -539,14 +585,40 @@ class ReplayBufferAsync(ReplayBuffer):
         return len(sampleable_keys) >= batch_size
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
-    def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
-        """Sample a batch while evicting and replacing stale, DAPO-filtered, or failed groups."""
+    def sample(
+        self,
+        global_steps: int,
+        partition_id: str,
+        batch_size: int,
+        exclude_uids: set[str] | None = None,
+    ) -> tuple[KVBatchMeta, dict]:
+        """Sample a batch while evicting and replacing stale, DAPO-filtered, or failed groups.
+
+        ``exclude_uids`` names groups the precision-escalation "drop" strategy has
+        rejected; their terminal members are cleared and refilled before selection,
+        exactly like an eviction.
+        """
         last_debug_time = time.time()
         eviction_metrics: dict = {}
+        # Per-call budget so a structurally short pipeline (oversample > what the
+        # pipeline replenishes) refills every step without ever tripping the cap.
+        self._stall_polls = 0
+        self._guard_refills = 0
 
         while True:
             # Eviction and selection share one snapshot so newly terminal stale groups wait for the next eviction pass.
             self._sync_metadata_from_transfer_queue()
+
+            # Precision-escalation drop: clear excluded terminal groups first so they
+            # can never be selected, and refill their slots to keep the batch full.
+            drop_uids = self._precision_drop_keys(partition_id, exclude_uids)
+            if drop_uids:
+                self._clear_groups(partition_id, drop_uids)
+                key = f"{self._metrics_prefix(partition_id)}/precision_drop/dropped_samples"
+                eviction_metrics[key] = eviction_metrics.get(key, 0) + len(drop_uids)
+                if self.refill_fn is not None:
+                    self.refill_fn(len(drop_uids))
+                continue
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
             evicted_uids, stale_count, _dapo_count, metrics = self._evict_terminal_groups(
@@ -566,6 +638,42 @@ class ReplayBufferAsync(ReplayBuffer):
                 break
 
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
+
+            # Self-heal guard: when the pool is starved (no in-flight requests, no
+            # eviction this poll) and cannot fill a batch for a sustained period,
+            # dispatch a fresh gen-batch to rebuild the surplus instead of polling
+            # forever. Without this, a single lost/redispatched group leaves sample()
+            # blocked indefinitely (observed deadlock: 143/144 terminal, 0 in flight,
+            # frozen for hours). A full gen-batch refill restores surplus with no
+            # dataloader waste: it tops the pool above batch_size, then the pool
+            # drains batch_size - gen_batch_size per step until the next stall.
+            if partition_id != "val" and self.refill_fn is not None:
+                inflight_count = len(self.pending_keys[partition_id]) + len(self.running_keys[partition_id])
+                if inflight_count == 0:
+                    self._stall_polls += 1
+                    if self._stall_polls >= VERL_REPLAY_BUFFER_STALL_POLL_THRESHOLD:
+                        if self._guard_refills >= VERL_REPLAY_BUFFER_MAX_GUARD_REFILLS:
+                            raise RuntimeError(
+                                f"[replay-buffer-stall] {len(sampleable_keys)}/{batch_size} terminal, "
+                                f"0 in-flight for {self._stall_polls * self.poll_interval:.0f}s; "
+                                f"{VERL_REPLAY_BUFFER_MAX_GUARD_REFILLS} refills failed to recover. "
+                                "Aborting instead of deadlocking."
+                            )
+                        refill_count = self.gen_batch_size or self.train_batch_size
+                        logger.warning(
+                            "[replay-buffer-stall] terminal=%d/%d, in-flight=0 for %d polls "
+                            "(%.0fs); dispatching %d prompts to rebuild the pool",
+                            len(sampleable_keys),
+                            batch_size,
+                            self._stall_polls,
+                            self._stall_polls * self.poll_interval,
+                            refill_count,
+                        )
+                        self._guard_refills += 1
+                        self._stall_polls = 0
+                        self.refill_fn(refill_count)
+                else:
+                    self._stall_polls = 0
 
         if partition_id != "val" and self.max_off_policy_strategy == "drop":
             selected_spans = [

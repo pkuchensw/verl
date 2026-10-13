@@ -23,6 +23,7 @@ from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
+from verl.workers.utils.score_centering import ScoreCenteringRuntimeConfig, score_centering_loss
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -54,12 +55,53 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
+def _pad_nested_field(t: torch.Tensor, pad: float = 0.0) -> torch.Tensor:
+    """Pad a (jagged) nested sequence field to ``[bsz, max_len, *rest]`` from its offsets.
+
+    ``TensorDict.to_padded_tensor`` is unreliable for nested tensors that have been
+    through the TransferQueue store: after a ``consolidate`` + pickle round-trip the
+    tensor's ragged metadata is lost, so ``to_padded_tensor`` pads every row to the
+    *total* flattened length (e.g. sum of response lengths) instead of the per-sample
+    max. The per-sample ``offsets()`` and ``values()`` survive intact, so rebuild the
+    padded view from those directly. For a healthy nested tensor this produces exactly
+    what ``to_padded_tensor`` would.
+    """
+    if not t.is_nested:
+        return t
+    lens = t.offsets().diff()
+    bsz = lens.numel()
+    max_len = int(lens.max().item()) if bsz else 0
+    values = t.values()
+    out = values.new_full((bsz, max_len, *tuple(t.shape[2:])), pad)
+    start = 0
+    for i, length in enumerate(lens.tolist()):
+        if length:
+            out[i, :length] = values[start : start + length]
+        start += length
+    return out
+
+
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
+
+    # Score Centering: the training logprobs of the sampler top-k ids, scattered by the
+    # engine into the same rmpad rows as log_probs, then sliced to the response window.
+    # Must run before `data` is replaced by the selected/padded view below.
+    sc_config = config.get("score_centering", None)
+    sc_enabled = bool(sc_config) and sc_config.get("enable", False)
+    train_sc_topk = None
+    if sc_enabled:
+        if "sc_topk_logprob" not in model_output:
+            raise ValueError(
+                "score_centering.enable=True but the engine produced no 'sc_topk_logprob'. "
+                "Check that the rollout recorded sc_topk_ids (rollout.score_centering_topk > 0) "
+                "and that use_fused_kernels=False."
+            )
+        train_sc_topk = no_padding_2_padding(model_output["sc_topk_logprob"], data)
 
     # global batch info for loss aggregation
     config.global_batch_info["dp_size"] = data["dp_size"]
@@ -88,7 +130,16 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
-    data = data.select(*fields).to_padded_tensor()
+    if sc_enabled:
+        for key in ("sc_topk_ids", "sc_topk_logprobs", "rollout_log_probs"):
+            if key not in data:
+                raise ValueError(f"score_centering.enable=True but data has no '{key}'")
+            fields.append(key)
+    selected = data.select(*fields)
+    data = TensorDict(
+        {f: _pad_nested_field(selected.get(f)) for f in fields},
+        batch_size=selected.batch_size,
+    )
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
@@ -100,24 +151,45 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
-    policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=rollout_is_weights,
-    )
+    if sc_enabled:
+        # Score Centering replaces the vanilla PG score term wholesale: the centered score
+        # ignores the PPO ratio clip, so mixing them would double-count the advantage.
+        # Entropy and KL below are left untouched.
+        sc_loss, sc_metrics = score_centering_loss(
+            train_sampled_logprob=log_prob,
+            train_topk_logprob=train_sc_topk,
+            sampler_topk_logprob=data["sc_topk_logprobs"].float(),
+            topk_mask=data["sc_topk_ids"] >= 0,
+            old_logprob=old_log_prob,
+            sampler_sampled_logprob=data["rollout_log_probs"],
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=ScoreCenteringRuntimeConfig.from_dict(sc_config),
+            global_batch_info=config.global_batch_info,
+        )
+        metrics.update(sc_metrics)
+        metrics["actor/pg_loss"] = Metric(value=sc_loss, aggregation=metric_aggregation)
+        policy_loss = sc_loss
+    else:
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
+        pg_loss, pg_metrics = policy_loss_fn(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=rollout_is_weights,
+        )
 
-    # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
-    # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
-    pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
+        # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
+        # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
+        pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
 
-    metrics.update(pg_metrics)
-    metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
-    policy_loss = pg_loss
+        metrics.update(pg_metrics)
+        metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
+        policy_loss = pg_loss
 
     # add entropy loss
     if entropy is not None:
@@ -126,7 +198,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         )
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
-        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
+        metrics["actor/entropy"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
     # add kl loss
     if config.use_kl_loss:
@@ -178,7 +250,11 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         metric_aggregation = AggregationType.MEAN
 
     # select fields and convert to padded tensor
-    data = data.select("values", "returns", "response_mask").to_padded_tensor()
+    selected = data.select("values", "returns", "response_mask")
+    data = TensorDict(
+        {f: _pad_nested_field(selected.get(f)) for f in ("values", "returns", "response_mask")},
+        batch_size=selected.batch_size,
+    )
     values = data["values"]
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)

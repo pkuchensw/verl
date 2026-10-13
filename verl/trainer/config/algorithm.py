@@ -137,6 +137,19 @@ class RolloutCorrectionConfig(BaseConfig):
               L = -E[min(r*A, clip(r)*A)] where r = π_current / π_rollout
             Default: "ppo_clip"
 
+        rollout_is_topk_ratio (Optional[float]): Per-sequence top-k hard selection (MIS_IS).
+            When set, only the top ``rollout_is_topk_ratio`` fraction of tokens per response
+            are kept in the training loss; all other tokens are hard-masked out (equal weight,
+            loss normalized over the selected tokens only). The selection score is the token
+            entropy by default (high-entropy "forking" tokens), falling back to |log ratio|
+            when entropy is not available. Must be in (0, 1]. Default: None.
+
+        rollout_is_topk_candidate_threshold (Optional[Union[str, float]]): Optional first-stage
+            candidate filter for top-k selection (IcePop bounds, e.g. "0.5_5.0"). When set,
+            only tokens whose raw IS weight π_train/π_rollout lies within [lower, upper] are
+            eligible for the subsequent entropy-based top-k selection; tokens outside the bounds
+            (extreme mismatch) are excluded entirely. Default: None.
+
     Example:
         # Create with defaults
         config = RolloutCorrectionConfig()
@@ -182,6 +195,8 @@ class RolloutCorrectionConfig(BaseConfig):
     rollout_rs_threshold: Optional[str | float] = None
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"
+    rollout_is_topk_ratio: Optional[float] = None
+    rollout_is_topk_candidate_threshold: Optional[str | float] = None
 
     @classmethod
     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
@@ -231,6 +246,40 @@ class RolloutCorrectionConfig(BaseConfig):
             RolloutCorrectionConfig configured for decoupled mode with token-level IcePop
         """
         return cls(rollout_is="token", rollout_is_threshold=f"{threshold_lower}_{threshold}", rollout_rs=None)
+
+    @classmethod
+    def decoupled_token_topk(
+        cls,
+        topk_ratio: float = 0.2,
+        candidate_is_threshold: Optional[str | float] = "0.5_5.0",
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled mode with two-stage per-sequence top-k hard mask (MIS_IS).
+
+        Stage 1 (candidate filter): only tokens whose raw IS weight π_train/π_rollout lies
+            within ``candidate_is_threshold`` (e.g. "0.5_5.0") are eligible — tokens with
+            extreme train/rollout mismatch are excluded.
+        Stage 2 (top-k selection): among the surviving candidates, keep only the top
+            ``topk_ratio`` fraction per response by token entropy (high-entropy "forking"
+            tokens, which steer reasoning direction). Non-selected tokens are excluded from
+            the loss entirely: hard 0/1 mask, equal weights, loss normalized over the
+            selected tokens only.
+
+        Args:
+            topk_ratio (float): Fraction of candidate tokens to keep per response by entropy.
+                Must be in (0, 1]. Default: 0.2 (keep top 20%).
+            candidate_is_threshold (Optional[Union[str, float]]): IcePop bounds for the
+                first-stage candidate filter. Set to None to skip the mismatch filter and
+                select purely by entropy. Default: "0.5_5.0".
+
+        Returns:
+            RolloutCorrectionConfig configured for decoupled mode with MIS-filtered entropy top-k.
+        """
+        return cls(
+            rollout_is=None,
+            rollout_rs=None,
+            rollout_is_topk_ratio=topk_ratio,
+            rollout_is_topk_candidate_threshold=candidate_is_threshold,
+        )
 
     @classmethod
     def decoupled_seq_is_rs(
@@ -670,3 +719,59 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    # Mismatch-aware partial rollout: at weight-sync time, roll back the prefix of
+    # unfinished partial-rollout requests whose per-token |log_ratio| (pi_new vs the
+    # saved rollout logprob) exceeds log_ratio_threshold, then resume from
+    # b = max(t* - rollback_window, 0) with the new model. Default off; flip enable.
+    partial_rollout_mismatch_truncation: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "log_ratio_threshold": 5.0,
+            "rollback_window": 32,
+        }
+    )
+    # Mismatch-driven precision escalation: a prompt group that trips the
+    # truncation / mismatch-gate mechanisms num_rollbacks_trigger times is judged
+    # to be blocked by the low-precision rollout engine itself, not by model
+    # staleness. What happens then depends on strategy:
+    #   - "switch" (default): the group's prior inference is discarded, it is buffered,
+    #     and once batch_size groups accumulate the rollout engine is switched to
+    #     target_precision ("bf16"), the batch is regenerated on it, then switched back.
+    #     One-shot per group, so a group that keeps tripping after bf16 does not cycle
+    #     the engine forever.
+    #   - "drop": the engine is left alone. A tripped group is rejected outright -- the
+    #     sampler clears its prompt + trajectories before it can enter a training batch
+    #     and refills the slot. Cheaper (no engine switch, no drain, not blocking) but
+    #     it discards the group rather than rescuing it; target_precision/batch_size are
+    #     unused.
+    # Default off; flip enable.
+    mismatch_precision_escalation: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "strategy": "switch",
+            "num_rollbacks_trigger": 3,
+            "batch_size": 32,
+            "target_precision": "bf16",
+            "max_buffer": 0,
+            "max_tracked": 0,
+        }
+    )
+    # Score Centering (arXiv 2609.20807v1): replace the REINFORCE score log p(a) of the
+    # sampled token with the centered score log p(a) - E_{v~q}[log p(v)], estimated from the
+    # rollout engine's sampler top-k. Removes the E_q[grad log p] component of the policy
+    # gradient, which is the part that injects systematic drift when the sampling
+    # distribution q (low-precision / stale rollout engine) disagrees with the training
+    # distribution p. Independent switch; when enable=False the original training path is
+    # used unchanged.
+    #   is_mode: none (pure SC) | tis (truncated IS on the sampled token) | mis (masked IS)
+    #   topk:    number of sampler top-k candidates recorded by the rollout engine
+    score_centering: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "topk": 8,
+            "is_mode": "none",
+            "is_low": 0.5,
+            "is_high": 5.0,
+            "coefficient_mode": "centered",
+        }
+    )

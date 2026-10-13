@@ -200,6 +200,50 @@ def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> 
     return logprobs_labels
 
 
+def _row_logsumexp_chunked(logits: torch.Tensor, chunk_size: int = 512) -> torch.Tensor:
+    """Row-wise ``logsumexp`` in FP32, chunked over rows to bound peak memory.
+
+    Materializing ``logits.float()`` for the whole tensor would allocate a second
+    ``(N, vocab)`` FP32 buffer, which is exactly the cost Score Centering must avoid.
+    Chunking keeps the peak at ``chunk_size * vocab * 4`` bytes while the reduction
+    itself is still FP32-exact.
+    """
+    n = logits.shape[0]
+    out = torch.empty(n, dtype=torch.float32, device=logits.device)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        out[start:end] = torch.logsumexp(logits[start:end].float(), dim=-1)
+    return out
+
+
+def logprobs_at_ids_from_logits(
+    logits: torch.Tensor,
+    ids: torch.Tensor,
+    invalid_id: int = -1,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """Full-vocabulary ``log p(v)`` for K arbitrary token ids per position.
+
+    ``ids`` may contain ``invalid_id`` slots (padding of the sampler top-k); those come
+    back as ``0.0`` and callers must mask them. Normalization is always over the full
+    vocabulary via ``logsumexp`` -- never a softmax restricted to ``ids``.
+
+    Args:
+        logits: ``(N, vocab)`` model logits; gradient flows through them.
+        ids: ``(N, K)`` int64 token ids, ``invalid_id`` for absent slots.
+        chunk_size: rows per ``logsumexp`` chunk (memory bound only).
+
+    Returns:
+        ``(N, K)`` FP32 log-probabilities.
+    """
+    valid = ids >= 0
+    safe_ids = ids.clamp(min=0)
+    gathered = torch.gather(logits, -1, safe_ids)
+    lse = _row_logsumexp_chunked(logits, chunk_size=chunk_size)
+    out = gathered.float() - lse.unsqueeze(-1)
+    return out.masked_fill(~valid, 0.0)
+
+
 def clip_by_value(x: torch.Tensor, tensor_min: torch.Tensor, tensor_max: torch.Tensor) -> torch.Tensor:
     """Clip tensor values to a range defined by tensor bounds.
 

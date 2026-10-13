@@ -50,7 +50,7 @@ from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
+from verl.workers.rollout.sglang_rollout.sglang_rollout import _kv_cache_resident, _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 
@@ -58,6 +58,44 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+
+def _extract_sc_topk_sglang(
+    meta_info: dict,
+    num_positions: int,
+    topk: int,
+) -> tuple[list[list[int]], list[list[float]]] | None:
+    """Extract the sampler's per-position top-k (token ids + q logprobs) for Score Centering.
+
+    SGLang returns ``meta_info["output_top_logprobs"]`` as a list with one entry per
+    generated position, each a ranked-best-first list of ``(logprob, token_id, text)``.
+    Shorter-than-``topk`` rows are padded with token id ``-1`` and logprob ``0.0`` so the
+    payload is fixed width ``[num_positions, topk]``; the loss treats ``id < 0`` as an
+    invalid slot and masks it out.
+
+    Returns ``None`` (and logs) when the payload is absent or misaligned with the
+    generated tokens, so the caller falls back to the plain (non-SC) path.
+    """
+    output_top = meta_info.get("output_top_logprobs") or []
+    if len(output_top) != num_positions:
+        logger.error(
+            f"output_top_logprobs length ({len(output_top)}) != output token count ({num_positions}); "
+            "skipping Score Centering top-k for this request"
+        )
+        return None
+    ids: list[list[int]] = []
+    logprobs: list[list[float]] = []
+    for entries in output_top:
+        entries = entries or []
+        row_ids = [int(tok_id) for _, tok_id, _ in entries[:topk]]
+        row_lps = [float(logprob) for logprob, _, _ in entries[:topk]]
+        pad = topk - len(row_ids)
+        if pad > 0:
+            row_ids.extend([-1] * pad)
+            row_lps.extend([0.0] * pad)
+        ids.append(row_ids)
+        logprobs.append(row_lps)
+    return ids, logprobs
 
 
 def _extract_prompt_logprobs_sglang(
@@ -354,16 +392,23 @@ class SGLangHttpServer:
 
         # enable_weights_cpu_backup is supported in sglang>=0.5.3
         if "enable_weights_cpu_backup" in [f.name for f in dataclasses.fields(ServerArgs)]:
-            # HYBRID mode also needs CPU weight backup so that:
-            #   1. sleep() can release GPU weights to free memory for the training engine.
-            #   2. naive update_weights() can call resume(tags=["weights"]) to reload weights
-            #      from CPU before applying the latest trainer weights via IPC.
-            # Without this, sleep() releases GPU memory but update_weights() cannot restore
-            # the weight buffers, causing OOM when training tries to use the freed memory.
+            # Keep it off by default: the backup makes every pause of the WEIGHTS
+            # region cudaMallocHost a copy of the whole model, and those pinned host
+            # pages are not handed back on resume -- they outlive the process that
+            # pinned them. Pinning a multi-GB region also needs a multi-MiB
+            # GFP_KERNEL|__GFP_ZERO block per chunk, so a colocated run both bleeds
+            # host RAM and fragments the node's unmovable pageblocks until
+            # torch_memory_saver's pause() can no longer place a chunk and sleep()
+            # starts failing ("cudaError error: 1 ... func=pause") while the trainer
+            # is still loading.
+            #
+            # Only the LoRA-adapter path needs it: there sleep_level=1 keeps the base
+            # weights across sleep, so sglang has to restore them itself. The naive
+            # weight sync re-pushes every tensor through update_weights() right after
+            # resume(tags=["weights"]), so it does not need the backup to refill the
+            # weight buffers. Set VERL_ENABLE_WEIGHTS_CPU_BACKUP=1 to force it on.
             enable_weights_cpu_backup = (
-                True
-                if self.rollout_mode in (RolloutMode.COLOCATED, RolloutMode.HYBRID) or self.model_config.lora_rank > 0
-                else False
+                self.model_config.lora_rank > 0 or os.environ.get("VERL_ENABLE_WEIGHTS_CPU_BACKUP", "0") == "1"
             )
             args["enable_weights_cpu_backup"] = enable_weights_cpu_backup
 
@@ -467,7 +512,9 @@ class SGLangHttpServer:
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            # Only resume weights (keep KV resident) in opt-in resident mode.
+            tags = ["weights"] if _kv_cache_resident(self.config) else ["kv_cache", "weights"]
+            obj = ResumeMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
@@ -489,8 +536,12 @@ class SGLangHttpServer:
         # When using LoRA as adapter (merge=False), only release kv_cache —
         # keep base weights in GPU so we only need to sync adapter deltas.
         # Mirrors the vLLM sleep() pattern in vllm_async_server.py.
+        # In opt-in resident mode, keep the fp8 KV cache in GPU and release
+        # only weights.
         if self.lora_as_adapter:
             tags = ["kv_cache"]
+        elif _kv_cache_resident(self.config):
+            tags = ["weights"]
         else:
             tags = ["kv_cache", "weights"]
 
@@ -501,9 +552,11 @@ class SGLangHttpServer:
             obj = ReleaseMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.release_memory_occupation(obj, None)
         elif self.rollout_mode == RolloutMode.STANDALONE:
-            # In standalone mode, resume kv_cache if free_cache_engine is enabled
-            obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
-            await self.tokenizer_manager.release_memory_occupation(obj, None)
+            # In standalone mode, release kv_cache if free_cache_engine is enabled.
+            # Skip the release in opt-in resident mode (fp8 KV kept in GPU).
+            if not _kv_cache_resident(self.config):
+                obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+                await self.tokenizer_manager.release_memory_occupation(obj, None)
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -595,6 +648,13 @@ class SGLangHttpServer:
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
+        # Score Centering: ask the rollout engine for the sampler's top-k token ids and
+        # their sampling logprobs at every generated position. Those ids are later scored
+        # by the training engine to form the centered score. Output-side only.
+        sc_topk = int(sampling_params.pop("score_centering_topk", 0) or 0)
+        if sc_topk > 0:
+            return_logprob = True
+
         # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
         # input-token logprobs for every position (top-K when K>0, sampled-token
         # logprob only when K==0). Translate to SGLang's per-request logprob API.
@@ -616,6 +676,15 @@ class SGLangHttpServer:
             request["logprob_start_len"] = 0
             if prompt_logprobs > 0:
                 request["top_logprobs_num"] = prompt_logprobs
+
+        if sc_topk > 0:
+            # top_logprobs_num is shared by SGLang's input/output top-logprob paths;
+            # without an explicit logprob_start_len it would also compute prompt-side top
+            # logprobs we never read. -1 puts the start at the prompt boundary, i.e. only
+            # the generated positions are scored.
+            request["top_logprobs_num"] = max(sc_topk, request.get("top_logprobs_num", 0))
+            if prompt_logprobs is None:
+                request["logprob_start_len"] = -1
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -683,6 +752,11 @@ class SGLangHttpServer:
                 sequence_length=len(prompt_ids),
                 result_dict=extra_fields,
             )
+
+        if sc_topk > 0:
+            sc = _extract_sc_topk_sglang(meta_info=meta_info, num_positions=len(token_ids), topk=sc_topk)
+            if sc is not None:
+                extra_fields["sc_topk_ids"], extra_fields["sc_topk_logprobs"] = sc
 
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
@@ -833,6 +907,7 @@ class SGLangReplica(RolloutReplica):
                 base_gpu_id=base_gpu_id,
             )
             self.servers.append(server)
+            self._server_names.append(name)
 
         # launch http server in each node
         master_address, master_port = None, None

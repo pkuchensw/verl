@@ -96,6 +96,50 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     return data
 
 
+def response_field_to_rmpad_label_positions(
+    field: torch.Tensor,
+    data: TensorDict,
+    total_nnz: int,
+    pad_value: int = -1,
+) -> torch.Tensor:
+    """Scatter a response-length-padded field ``[bsz, max_response_len, K]`` into the rmpad
+    rows that ``no_padding_2_padding`` reads.
+
+    ``no_padding_2_padding`` slices ``values[seq_offset - resp_len - 1 : seq_offset - 1]``
+    per sequence; this writes ``field[i, :resp_len]`` into exactly those rows, so gathering
+    at those rmpad rows stays aligned with the response axis. Rows outside every response
+    window keep ``pad_value``.
+
+    Only used by Score Centering to line the sampler top-k ids up with the training logits.
+    """
+    prompt_ids = data["prompts"]
+    response_ids = data["responses"]
+    if prompt_ids.is_nested:
+        prompt_lens = prompt_ids.offsets().diff()
+        response_lens = response_ids.offsets().diff()
+    else:
+        attention_mask = data["attention_mask"]
+        assert not attention_mask.is_nested
+        prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+        response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+    sequence_offsets = (prompt_lens + response_lens).cumsum(dim=0)
+
+    width = field.shape[-1]
+    # ``new_full`` is unimplemented on nested tensors; the flat ``values()`` (or the plain
+    # tensor itself) carries the same dtype/device and works as the allocation prototype.
+    proto = field.values() if field.is_nested else field
+    out = proto.new_full((total_nnz, width), pad_value)
+    for i, (resp_len, seq_offset) in enumerate(zip(response_lens, sequence_offsets, strict=True)):
+        resp_len = int(resp_len)
+        seq_offset = int(seq_offset)
+        # A jagged nested field is [bsz, j1, K]: ``field[i]`` is sample i's [len_i, K] block,
+        # whereas ``field.values()`` would flatten the jagged dim and index by rmpad row.
+        # A regular field is [bsz, max_response_len, K] and needs explicit column slicing.
+        rows = field[i][:resp_len] if field.is_nested else field[i, :resp_len]
+        out[seq_offset - resp_len - 1 : seq_offset - 1] = rows
+    return out
+
+
 def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
     """Slice response from unpad model output.
 

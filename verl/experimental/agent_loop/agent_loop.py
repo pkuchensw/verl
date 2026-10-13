@@ -78,6 +78,38 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+def _pad_sc_topk(
+    ids: list[list[int]],
+    logprobs: list[list[float]],
+    response_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad/slice per-position Score Centering top-k rows to ``[1, response_length, K]``.
+
+    Rows past the generated length are filled with token id ``-1`` / logprob ``0.0``; the
+    loss treats ``id < 0`` as an invalid slot and masks it out.
+    """
+    if len(ids) != len(logprobs):
+        raise ValueError(f"sc_topk ids/logprobs length mismatch: {len(ids)} vs {len(logprobs)}")
+    if not ids:
+        raise ValueError("sc_topk rows are empty; cannot infer top-k width")
+    width = len(ids[0])
+    if width == 0:
+        raise ValueError("sc_topk rows have zero width")
+    for row in ids:
+        if len(row) != width:
+            raise ValueError(f"ragged sc_topk ids row: expected width {width}, got {len(row)}")
+    ids = ids[:response_length]
+    logprobs = logprobs[:response_length]
+    pad = response_length - len(ids)
+    if pad > 0:
+        ids = ids + [[-1] * width for _ in range(pad)]
+        logprobs = logprobs + [[0.0] * width for _ in range(pad)]
+    return (
+        torch.tensor(ids, dtype=torch.int64).unsqueeze(0),
+        torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
+    )
+
+
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
 
@@ -144,6 +176,19 @@ class AgentLoopOutput(BaseModel):
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
+
+        # Score Centering: sampler top-k token ids + their sampling logprobs. Convert the
+        # rollout's per-position lists into [response_length, K] tensors (token id -1 /
+        # logprob 0.0 on invalid rows) so the trajectory carries them as response-aligned
+        # sequence fields, matching how `rollout_log_probs` is handled above.
+        sc_topk_ids = output["extra_fields"].pop("sc_topk_ids", None)
+        sc_topk_logprobs = output["extra_fields"].pop("sc_topk_logprobs", None)
+        if sc_topk_ids is not None or sc_topk_logprobs is not None:
+            if sc_topk_ids is None or sc_topk_logprobs is None:
+                raise ValueError("sc_topk_ids present without sc_topk_logprobs")
+            ids_t, lps_t = _pad_sc_topk(sc_topk_ids, sc_topk_logprobs, output["response_mask"].size(0))
+            output["sc_topk_ids"] = ids_t.squeeze(0)
+            output["sc_topk_logprobs"] = lps_t.squeeze(0)
         return output
 
 
@@ -170,6 +215,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
+    sc_topk_ids: Optional[torch.Tensor] = None
+    """Padded sampler top-k token ids for Score Centering, shape [1, response_length, K]."""
+    sc_topk_logprobs: Optional[torch.Tensor] = None
+    """Padded sampling logprobs of the top-k ids, shape [1, response_length, K]."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -594,6 +643,10 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        # Score Centering: request the sampler's top-k token ids + q logprobs per position.
+        sc_topk = int(getattr(config, "score_centering_topk", 0) or 0)
+        if sc_topk > 0:
+            sampling_params["score_centering_topk"] = sc_topk
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0
@@ -657,6 +710,23 @@ class AgentLoopWorker:
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
         return output
+
+    def get_inflight_prefixes(self) -> list[dict[str, Any]]:
+        """Return partial-rollout prefixes of in-flight generate calls on this worker.
+
+        Delegates to the underlying LLM client (FullyAsyncLLMServerClient). Returns
+        an empty list when the client does not track in-flight prefixes (e.g. a
+        non-FullyAsync client in sync / non-partial-rollout setups).
+        """
+        if not hasattr(self.llm_client, "get_inflight_prefixes"):
+            return []
+        return self.llm_client.get_inflight_prefixes()
+
+    def set_truncation_points(self, truncations: dict[str, int]) -> None:
+        """Record per-request rollback points on this worker's LLM client."""
+        if not hasattr(self.llm_client, "set_truncation_points"):
+            return
+        self.llm_client.set_truncation_points(truncations)
 
     async def _run_agent_loop(
         self,
@@ -775,6 +845,17 @@ class AgentLoopWorker:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
+        sc_topk_ids = None
+        sc_topk_logprobs = None
+        sc_ids_raw = output.extra_fields.get("sc_topk_ids")
+        if sc_ids_raw is not None:
+            sc_lps_raw = output.extra_fields.get("sc_topk_logprobs")
+            if sc_lps_raw is None:
+                raise ValueError("sc_topk_ids present without sc_topk_logprobs")
+            sc_topk_ids, sc_topk_logprobs = _pad_sc_topk(
+                sc_ids_raw, sc_lps_raw, self.rollout_config.response_length
+            )
+
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -857,6 +938,8 @@ class AgentLoopWorker:
             mm_processor_kwargs=output.mm_processor_kwargs,
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
+            sc_topk_ids=sc_topk_ids,
+            sc_topk_logprobs=sc_topk_logprobs,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -1050,6 +1133,9 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if inputs[0].sc_topk_ids is not None and inputs[0].sc_topk_logprobs is not None:
+            optional_outputs["sc_topk_ids"] = torch.cat([input.sc_topk_ids for input in inputs], dim=0)
+            optional_outputs["sc_topk_logprobs"] = torch.cat([input.sc_topk_logprobs for input in inputs], dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -1233,6 +1319,32 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+
+    @auto_await
+    async def get_inflight_prefixes(self) -> list[dict[str, Any]]:
+        """Gather partial-rollout prefixes of in-flight generate calls across workers.
+
+        Each entry carries the owning worker index so the trainer can dispatch
+        truncation points back to the right worker.
+        """
+        prefixes = []
+        for worker_idx, worker in enumerate(self.agent_loop_workers):
+            worker_prefixes = await worker.get_inflight_prefixes.remote()
+            for p in worker_prefixes:
+                p["worker_idx"] = worker_idx
+            prefixes.extend(worker_prefixes)
+        return prefixes
+
+    @auto_await
+    async def set_truncation_points(self, by_worker: dict[int, dict[str, int]]) -> None:
+        """Dispatch per-request rollback points (response-token index) to the
+        owning workers' LLM clients."""
+        await asyncio.gather(
+            *[
+                self.agent_loop_workers[worker_idx].set_truncation_points.remote(truncations)
+                for worker_idx, truncations in by_worker.items()
+            ]
+        )
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}

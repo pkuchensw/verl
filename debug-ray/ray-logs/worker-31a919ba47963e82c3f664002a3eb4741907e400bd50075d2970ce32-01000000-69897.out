@@ -1,0 +1,172 @@
+:job_id:01000000
+INFO 09-15 20:51:38 [__init__.py:216] Automatically detected platform cuda.
+:actor_name:WorkerDict
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen2ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+TENCENT64:69897:70755 [0] NCCL INFO cudaDriverVersion 12080
+TENCENT64:69897:70755 [0] NCCL INFO NCCL_SOCKET_IFNAME set to bond1
+TENCENT64:69897:70755 [0] NCCL INFO NCCL version 2.27.5+cuda12.9
+TENCENT64:69897:71080 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. 
+TENCENT64:69897:71080 [0] NCCL INFO NCCL_IB_HCA set to mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [2] mlx5_bond_7:uverbs10:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb3732bb80 pciPath=/sys/devices/pci0000:80/0000:80:01.1/0000:81:00.0/0000:82:00.0/0000:83:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [0] name=mlx5_bond_7 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [3] mlx5_bond_8:uverbs11:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb3736d250 pciPath=/sys/devices/pci0000:b2/0000:b2:01.1/0000:b3:00.0/0000:b4:00.0/0000:b5:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [1] name=mlx5_bond_8 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [4] mlx5_bond_3:uverbs6:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb373af930 pciPath=/sys/devices/pci0000:12/0000:12:03.1/0000:19:00.0/0000:1a:00.0/0000:1b:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [2] name=mlx5_bond_3 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [5] mlx5_bond_4:uverbs4:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb373f1000 pciPath=/sys/devices/pci0000:12/0000:12:01.1/0000:13:00.0/0000:14:00.0/0000:15:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [3] name=mlx5_bond_4 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [6] mlx5_bond_5:uverbs5:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb374326d0 pciPath=/sys/devices/pci0000:b2/0000:b2:03.1/0000:b9:00.0/0000:ba:01.0/0000:bc:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [4] name=mlx5_bond_5 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [7] mlx5_bond_1:uverbs0:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb37473da0 pciPath=/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:01.0/0000:04:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [5] name=mlx5_bond_1 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [8] mlx5_bond_2:uverbs2:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb374b5470 pciPath=/sys/devices/pci0000:2b/0000:2b:01.1/0000:2c:00.0/0000:2d:01.0/0000:2f:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [6] name=mlx5_bond_2 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB: [9] mlx5_bond_6:uverbs14:1/RoCE provider=Mlx5 speed=200000 context=0x7fbb374f6b40 pciPath=/sys/devices/pci0000:99/0000:99:01.1/0000:9a:00.0/0000:9b:01.0/0000:9d:00.0 ar=0
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Made virtual device [7] name=mlx5_bond_6 speed=200000 ndevs=1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : Using [0]mlx5_bond_7:1/RoCE [1]mlx5_bond_8:1/RoCE [2]mlx5_bond_3:1/RoCE [3]mlx5_bond_4:1/RoCE [4]mlx5_bond_5:1/RoCE [5]mlx5_bond_1:1/RoCE [6]mlx5_bond_2:1/RoCE [7]mlx5_bond_6:1/RoCE [RO]; OOB bond1:28.49.24.105<0>
+TENCENT64:69897:71080 [0] NCCL INFO Initialized NET plugin IB
+TENCENT64:69897:71080 [0] NCCL INFO Assigned NET plugin IB to comm
+TENCENT64:69897:71080 [0] NCCL INFO Using network IB
+TENCENT64:69897:71080 [0] NCCL INFO ncclCommInitRankConfig comm 0x7fbd89d431c0 rank 3 nranks 8 cudaDev 0 nvmlDev 3 busId 2e000 commId 0x8a49dbeb614f1466 - Init START
+TENCENT64:69897:71080 [0] NCCL INFO RAS client listening socket at ::1<28028>
+TENCENT64:69897:71080 [0] NCCL INFO NCCL_P2P_DISABLE set by environment to 1
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 0 'mlx5_bond_7'
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 1 'mlx5_bond_8'
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 2 'mlx5_bond_3'
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 3 'mlx5_bond_4'
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 4 'mlx5_bond_5'
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 5 'mlx5_bond_1'
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 6 'mlx5_bond_2'
+TENCENT64:69897:71080 [0] NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 7 'mlx5_bond_6'
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 0 / HCA 5 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 1 / HCA 3 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 2 / HCA 2 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 3 / HCA 6 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 4 / HCA 0 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 5 / HCA 7 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 6 / HCA 1 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO GPU Direct RDMA Enabled for GPU 7 / HCA 4 (distance 4 <= 5), read 0 mode Default
+TENCENT64:69897:71080 [0] NCCL INFO Setting affinity for GPU 3 to 0-95,192-287
+TENCENT64:69897:71080 [0] NCCL INFO NVLS multicast support is available on dev 0 (NVLS_NCHANNELS 16)
+TENCENT64:69897:71080 [0] NCCL INFO comm 0x7fbd89d431c0 rank 3 nRanks 8 nNodes 1 localRanks 8 localRank 3 MNNVL 0
+TENCENT64:69897:71080 [0] NCCL INFO Trees [0] 4/-1/-1->3->2 [1] 4/-1/-1->3->2 [2] 4/-1/-1->3->2 [3] 4/-1/-1->3->2 [4] 4/-1/-1->3->2 [5] 4/-1/-1->3->2 [6] 4/-1/-1->3->2 [7] 4/-1/-1->3->2 [8] 4/-1/-1->3->2 [9] 4/-1/-1->3->2 [10] 4/-1/-1->3->2 [11] 4/-1/-1->3->2 [12] 4/-1/-1->3->2 [13] 4/-1/-1->3->2 [14] 4/-1/-1->3->2 [15] 4/-1/-1->3->2
+TENCENT64:69897:71080 [0] NCCL INFO P2P Chunksize set to 131072
+TENCENT64:69897:71080 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so. 
+TENCENT64:69897:71178 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 207
+TENCENT64:69897:71177 [0] NCCL INFO [Proxy Service] Device 0 CPU core 282
+TENCENT64:69897:71080 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x7f6df3127400
+TENCENT64:69897:71080 [0] NCCL INFO threadThresholds 8/8/64 | 64/8/64 | 512 | 512
+TENCENT64:69897:71080 [0] NCCL INFO 16 coll channels, 16 collnet channels, 16 nvls channels, 16 p2p channels, 2 p2p channels per peer
+TENCENT64:69897:71080 [0] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+TENCENT64:69897:71080 [0] NCCL INFO ncclCommInitRankConfig comm 0x7fbd89d431c0 rank 3 nranks 8 cudaDev 0 nvmlDev 3 busId 2e000 commId 0x8a49dbeb614f1466 - Init COMPLETE
+TENCENT64:69897:71080 [0] NCCL INFO Init timings - ncclCommInitRankConfig: rank 3 nranks 8 total 2.63 (kernels 0.16, alloc 1.35, bootstrap 0.31, allgathers 0.01, topo 0.58, graphs 0.00, connections 0.16, rest 0.06)
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 0 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18004f30
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 1 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18004fa8
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 2 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005020
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 3 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005098
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 4 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005110
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 5 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005188
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 6 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005200
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 7 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005278
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 8 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb180052f0
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 9 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005368
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 10 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb180053e0
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 11 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005458
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 12 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb180054d0
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 13 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005548
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 14 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb180055c0
+TENCENT64:69897:71177 [0] NCCL INFO New proxy recv connection 15 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005638
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 16 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb180056b0
+TENCENT64:69897:71179 [0] NCCL INFO Channel 00 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 17 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005728
+TENCENT64:69897:71179 [0] NCCL INFO Channel 01 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 18 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb180057a0
+TENCENT64:69897:71179 [0] NCCL INFO Channel 02 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 19 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005818
+TENCENT64:69897:71179 [0] NCCL INFO Channel 03 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 20 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005890
+TENCENT64:69897:71179 [0] NCCL INFO Channel 04 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 21 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005908
+TENCENT64:69897:71179 [0] NCCL INFO Channel 05 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 22 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005980
+TENCENT64:69897:71179 [0] NCCL INFO Channel 06 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 23 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb180059f8
+TENCENT64:69897:71179 [0] NCCL INFO Channel 07 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 24 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005a70
+TENCENT64:69897:71179 [0] NCCL INFO Channel 08 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 25 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005ae8
+TENCENT64:69897:71179 [0] NCCL INFO Channel 09 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 26 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005b60
+TENCENT64:69897:71179 [0] NCCL INFO Channel 10 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 27 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005bd8
+TENCENT64:69897:71179 [0] NCCL INFO Channel 11 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 28 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005c50
+TENCENT64:69897:71179 [0] NCCL INFO Channel 12 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 29 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005cc8
+TENCENT64:69897:71179 [0] NCCL INFO Channel 13 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 30 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005d40
+TENCENT64:69897:71179 [0] NCCL INFO Channel 14 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 31 from local rank 3, transport 1
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 3 -> connection 0x7fbb18005db8
+TENCENT64:69897:71179 [0] NCCL INFO Channel 15 : 3[3] -> 4[4] via SHM/direct/direct
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 32 from local rank 2, transport 0
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 4 -> connection 0x7f2944005ac0
+TENCENT64:69897:71179 [0] NCCL INFO Connected to proxy localRank 2 -> connection 0x7f9d08005b38
+TENCENT64:69897:71177 [0] NCCL INFO New proxy send connection 33 from local rank 4, transport 0
+TENCENT64:69897:71179 [0] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+INFO 09-15 20:52:54 [__init__.py:216] Automatically detected platform cuda.
+TENCENT64:69897:74977 [0] NCCL INFO socketProgressOpt: abort called
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:64 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:81 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:863 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO socketProgressOpt: abort called
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:64 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:81 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:863 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO socketProgressOpt: abort called
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:64 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:81 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:863 -> 3
+TENCENT64:69897:71177 [0] NCCL INFO socketProgressOpt: abort called
+TENCENT64:69897:71177 [0] NCCL INFO misc/socket.cc:915 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO socketProgressOpt: abort called
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:64 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:81 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO misc/socket.cc:863 -> 3
+TENCENT64:69897:74977 [0] NCCL INFO comm 0x7fbd89d431c0 rank 3 nranks 8 cudaDev 0 busId 2e000 - Abort COMPLETE

@@ -169,6 +169,10 @@ class ActorConfig(BaseConfig):
     calculate_entropy: bool = False
     calculate_sum_pi_squared: bool = False
     use_kl_loss: bool = False
+    # Score Centering (arXiv 2609.20807v1): replaces the sampled-token score log p(a) with
+    # the centered score log p(a) - E_{v~q}[log p(v)] using the rollout engine's sampler
+    # top-k. Populated from ``algorithm.score_centering`` by the trainer.
+    score_centering: dict[str, Any] = field(default_factory=dict)
     # Whether to enable PrefixGrouper-based shared-prefix forward
     use_prefix_grouper: bool = False
     use_torch_compile: bool = True

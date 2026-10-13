@@ -50,8 +50,61 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def is_kv_cache_fp8(config: RolloutConfig) -> bool:
+    """True when the sglang rollout uses an fp8 KV cache dtype."""
+    sglang_kwargs = config.engine_kwargs.get("sglang", {}) or {}
+    kv_dtype = sglang_kwargs.get("kv_cache_dtype")
+    return isinstance(kv_dtype, str) and kv_dtype.startswith("fp8")
+
+
+def _kv_cache_resident(config: RolloutConfig) -> bool:
+    """Opt-in KV-resident mode: keep the fp8 KV cache in GPU, release only weights.
+
+    fp8 KV pause/resume historically crashed in the forked scheduler subprocess
+    (cuMemUnmap returns CUDA error 1), so such runs kept the KV cache resident.
+    The scheduler_update_weights_mixin release-order fix (pause WEIGHTS before
+    KV_CACHE) makes the fp8 KV pause work, so full release is now the default.
+    Set VERL_FORCE_KV_RESIDENT=1 to force resident mode on sglang builds
+    without that fix.
+    """
+    return is_kv_cache_fp8(config) and os.environ.get("VERL_FORCE_KV_RESIDENT", "0") == "1"
+
+
+def _drop_expandable_segments_allocator_conf() -> None:
+    """Drop ``expandable_segments`` from the CUDA allocator conf of this process tree.
+
+    ``enable_memory_saver`` pauses/resumes allocations through CUDA VMM
+    (``cuMemUnmap``/``cuMemMap``) on a private allocator pool, and
+    ``torch_memory_saver`` refuses to run at all when the caching allocator is in
+    expandable-segments mode -- ``_sanity_checks()`` raises
+    "expandable_segments is not supported yet" as soon as the memory saver is
+    initialized. So the flag must not reach any process that has a memory saver.
+
+    Launchers export ``expandable_segments:True`` for the *training* process, and
+    the scheduler subprocesses inherit the environment (they are ``mp``-spawned),
+    so the flag has to be removed here -- in the server process, before the
+    subprocesses start. It is intentionally not removed for the trainer, whose
+    allocator keeps its fragmentation behavior.
+    """
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        conf = os.environ.get(var, "")
+        if "expandable_segments" not in conf:
+            continue
+        kept = [opt for opt in conf.split(",") if not opt.strip().startswith("expandable_segments")]
+        if kept:
+            os.environ[var] = ",".join(kept)
+        else:
+            del os.environ[var]
+        logger.warning("%s=%r reached the rollout server; dropped expandable_segments for the memory saver", var, conf)
+
+
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
 def _set_envs_and_config(server_args: ServerArgs):
+    # The memory saver and the expandable-segments allocator are mutually exclusive;
+    # sglang turns the former on for any server that can be released/resumed.
+    if getattr(server_args, "enable_memory_saver", False):
+        _drop_expandable_segments_allocator_conf()
+
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
@@ -191,6 +244,10 @@ class ServerAdapter(BaseRollout):
         # Set by engine_workers.update_weights() when lora.merge=False.
         self.sleep_level = 2
 
+    @property
+    def kv_cache_resident(self) -> bool:
+        return _kv_cache_resident(self.config)
+
     async def _init_server_adapter(self):
         if self._engine is not None:
             return
@@ -276,7 +333,9 @@ class ServerAdapter(BaseRollout):
 
         When sleep_level=1 (LoRA adapter mode), only releases kv_cache
         to keep base weights alive across training iterations.
-        When sleep_level=2 (default/merge mode), releases everything.
+        When sleep_level=2 (default/merge mode), releases everything,
+        except when the KV cache is fp8 — then only weights are released
+        and the KV cache stays resident (fp8 KV can't be paused/resumed).
         """
         await self._init_server_adapter()
         if self._engine is None:
@@ -284,6 +343,8 @@ class ServerAdapter(BaseRollout):
         if self._is_server_tp_leader() and self.config.free_cache_engine:
             if self.sleep_level == 1:
                 tags = ["kv_cache"]
+            elif _kv_cache_resident(self.config):
+                tags = ["weights"]
             else:
                 tags = ["kv_cache", "weights"]
             await self._engine.release_memory_occupation(tags=tags)

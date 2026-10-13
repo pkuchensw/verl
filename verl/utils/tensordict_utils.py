@@ -564,8 +564,8 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
 
     Args:
         tensordict: The TensorDict to iterate over.
-        mini_batch_size: Size of each mini-batch. Must evenly divide the
-            TensorDict's batch size.
+        mini_batch_size: Size of each mini-batch. The final mini-batch may be
+            smaller when the batch size is not a multiple (ragged tail).
         epochs: Number of times to iterate through the entire dataset.
         seed: Optional random seed for reproducible shuffling.
         dataloader_kwargs: Optional dict of additional kwargs to pass to
@@ -573,9 +573,6 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
 
     Returns:
         An iterator that yields TensorDict mini-batches.
-
-    Raises:
-        AssertionError: If batch size is not divisible by mini_batch_size.
 
     Example:
         >>> td = TensorDict({"obs": torch.randn(100, 4)}, batch_size=[100])
@@ -585,7 +582,12 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
     """
     from torch.utils.data import DataLoader
 
-    assert tensordict.batch_size[0] % mini_batch_size == 0, f"{tensordict.batch_size[0]} % {mini_batch_size} != 0"
+    # Allow a ragged final mini-batch: a gate-screened batch may leave a clean count
+    # that is not a multiple of the mini-batch size. torch's DataLoader (drop_last=False,
+    # the default) yields the remainder as a final smaller chunk, so no divisibility is
+    # required here. All DP ranks hold the same local count (the batch is dp-divisible),
+    # so they iterate the same number of chunks and the FSDP all-reduces stay aligned.
+    assert mini_batch_size > 0, f"mini_batch_size must be positive, got {mini_batch_size}"
     # we can directly create a dataloader from TensorDict
     if dataloader_kwargs is None:
         dataloader_kwargs = {}
@@ -930,20 +932,20 @@ def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDic
     dict_of_lists = {key: [d[key] for d in list_of_dicts] for key in keys}
     batch_size = len(list_of_dicts)
 
-    final_data = {
-        key: (
-            torch.stack(val_list)
-            if val_list
-            and all(isinstance(item, torch.Tensor) for item in val_list)
-            and all(item.shape == val_list[0].shape for item in val_list)
-            else (
-                torch.nested.as_nested_tensor(val_list, layout=torch.jagged)
-                if val_list and all(isinstance(item, torch.Tensor) for item in val_list)
-                else NonTensorStack(*val_list)
-            )
-        )
-        for key, val_list in dict_of_lists.items()
-    }
+    final_data = {}
+    for key, val_list in dict_of_lists.items():
+        if val_list and all(isinstance(item, torch.Tensor) for item in val_list):
+            if val_list[0].ndim == 0:
+                # Scalar-per-sample tensors (e.g. temperature): keep a regular (B,) tensor.
+                final_data[key] = torch.stack(val_list)
+            else:
+                # Sequence fields must stay ragged even when all rows happen to share
+                # the same length. Collapsing equal-length rows into a regular tensor
+                # breaks the FSDP engine and loss, which call .offsets()/.values() on
+                # them (see "nested_tensor must be nested" in expand_as_nested).
+                final_data[key] = torch.nested.as_nested_tensor(val_list, layout=torch.jagged)
+        else:
+            final_data[key] = NonTensorStack(*val_list)
 
     td = TensorDict(final_data, batch_size=[batch_size])
 

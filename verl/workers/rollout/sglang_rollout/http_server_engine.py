@@ -740,7 +740,10 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         Returns:
             Dict[str, Any]: Server response indicating memory resume status
         """
-        return await self._make_async_request("resume_memory_occupation", {"tags": tags})
+        # 120s bounds the worst case (a genuinely stuck scheduler handler) to
+        # ~6 min/attempt instead of 15. Normal resumes map the weight/KV regions
+        # via CUDA VMM and complete in well under a second.
+        return await self._make_async_request("resume_memory_occupation", {"tags": tags}, timeout=120.0)
 
     async def update_weights_from_tensor(
         self,
@@ -772,6 +775,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
                 "load_format": load_format,
                 "flush_cache": flush_cache,
             },
+            timeout=300.0,
         )
 
     async def load_lora_adapter_from_tensor(self, req):

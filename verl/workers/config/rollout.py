@@ -218,6 +218,11 @@ class RolloutConfig(BaseConfig):
 
     calculate_log_probs: bool = False
 
+    # Score Centering: number of sampler top-k candidates recorded per generated position
+    # (token ids + their sampling logprobs). 0 disables recording. The recorded ids are
+    # scored by the training engine to build the centered score.
+    score_centering_topk: int = 0
+
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)

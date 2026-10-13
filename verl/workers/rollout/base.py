@@ -41,6 +41,11 @@ class BaseRollout(ABC):
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
         self.device_mesh = device_mesh
 
+    @property
+    def kv_cache_resident(self) -> bool:
+        """Whether the KV cache must stay resident (cannot be released during sleep)."""
+        return False
+
     @abstractmethod
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.

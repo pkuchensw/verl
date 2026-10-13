@@ -781,6 +781,78 @@ def compute_is_metrics(
     return metrics
 
 
+def compute_topk_selection_mask(
+    log_ratio: torch.Tensor,
+    response_mask: torch.Tensor,
+    topk_ratio: float,
+    entropy: Optional[torch.Tensor] = None,
+    candidate_is_threshold: Optional[str | float] = None,
+) -> torch.Tensor:
+    """Per-sequence hard mask with optional mismatch candidate filter + entropy top-k.
+
+    Two-stage selection:
+    - Stage 1 (candidate filter): if ``candidate_is_threshold`` is set (e.g. "0.5_5.0"),
+      only tokens whose raw IS weight π_train/π_rollout lies within the bounds are eligible;
+      tokens with extreme train/rollout mismatch are excluded.
+    - Stage 2 (top-k): among the surviving candidates, keep the ``k = ceil(topk_ratio * #candidates)``
+      tokens with the largest selection score. The score is the token entropy when ``entropy``
+      is provided (high-entropy "forking" tokens), otherwise falls back to |log ratio|.
+
+    All non-selected tokens are hard-masked out (equal weight, loss normalized over the
+    selected tokens only).
+
+    Args:
+        log_ratio: Log ratio of training policy probability to rollout policy probability,
+            shape (batch_size, seq_length).
+        response_mask: Binary mask for valid tokens (1=valid, 0=padding),
+            shape (batch_size, seq_length).
+        topk_ratio: Fraction of candidate tokens to keep per sequence, must be in (0, 1].
+        entropy: Token entropy of the training policy, shape (batch_size, seq_length).
+            Used as the top-k selection score. If None, falls back to |log_ratio|.
+        candidate_is_threshold: IcePop bounds for the first-stage mismatch candidate filter,
+            e.g. "0.5_5.0". If None, all valid tokens are candidates.
+
+    Returns:
+        Hard 0/1 mask of shape (batch_size, seq_length); 1 where the token is kept.
+    """
+    if not 0.0 < topk_ratio <= 1.0:
+        raise ValueError(f"topk_ratio must be in (0, 1], got {topk_ratio}.")
+    valid_bool = response_mask.bool()
+
+    # Stage 1: candidate mask = valid tokens ∩ (IcePop mismatch bounds, if requested)
+    if candidate_is_threshold is not None:
+        upper, lower = _parse_rollout_is_threshold(candidate_is_threshold)
+        raw_weights = torch.exp(torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND))
+        candidate_mask = ((raw_weights >= lower) & (raw_weights <= upper)) & valid_bool
+    else:
+        candidate_mask = valid_bool
+
+    candidate_counts = candidate_mask.sum(dim=-1)  # (batch_size,)
+    num_keep = torch.clamp(
+        (candidate_counts * topk_ratio).ceil().to(torch.long), max=candidate_counts.to(torch.long)
+    )
+
+    # Stage 2: selection score = entropy (preferred) or |log_ratio| (fallback)
+    if entropy is not None:
+        selection_scores = entropy
+    else:
+        selection_scores = log_ratio.abs()
+
+    keep_mask = torch.zeros_like(response_mask, dtype=response_mask.dtype)
+    for i in range(candidate_mask.shape[0]):
+        n = int(candidate_counts[i].item())
+        if n == 0:
+            continue
+        k = int(num_keep[i].item())
+        if k >= n:
+            keep_mask[i, candidate_mask[i]] = 1.0
+            continue
+        seq_scores = selection_scores[i].masked_fill(~candidate_mask[i], float("-inf"))
+        topk_indices = torch.topk(seq_scores, k).indices
+        keep_mask[i, topk_indices] = 1.0
+    return keep_mask
+
+
 def compute_rollout_correction_and_rejection_mask(
     old_log_prob: torch.Tensor,
     rollout_log_prob: torch.Tensor,
@@ -790,6 +862,9 @@ def compute_rollout_correction_and_rejection_mask(
     rollout_is_batch_normalize: bool = False,
     rollout_rs: Optional[str] = None,
     rollout_rs_threshold: Optional[str | float] = None,
+    rollout_is_topk_ratio: Optional[float] = None,
+    rollout_is_topk_candidate_threshold: Optional[str | float] = None,
+    entropy: Optional[torch.Tensor] = None,
 ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
     """Unified interface for computing IS weights and rejection masks.
 
@@ -819,6 +894,14 @@ def compute_rollout_correction_and_rejection_mask(
             ``lower_upper`` to denote the lower/upper ratio bounds.
         rollout_is_batch_normalize: Whether to normalize IS weights to have mean=1.0 per batch.
             Default: False.
+        rollout_is_topk_ratio: Per-sequence top-k hard selection (MIS_IS). When set, only the
+            top ``rollout_is_topk_ratio`` fraction of candidate tokens per response are kept in
+            the training mask; the rest are hard-masked out. Default: None.
+        rollout_is_topk_candidate_threshold: Optional IcePop bounds (e.g. "0.5_5.0") for the
+            first-stage mismatch candidate filter; tokens with extreme IS weight are excluded
+            before entropy top-k. Default: None.
+        entropy: Token entropy of the training policy, used as the top-k selection score.
+            If None, falls back to |log ratio|. Default: None.
 
     Returns:
         Tuple containing:
@@ -874,6 +957,32 @@ def compute_rollout_correction_and_rejection_mask(
             rollout_rs_threshold=rollout_rs_threshold,
         )
         metrics.update(rs_metrics)
+
+    # Step 3.5: Apply per-sequence top-k hard selection (MIS_IS)
+    # Two-stage: optional IcePop mismatch candidate filter, then entropy-based top-k.
+    if rollout_is_topk_ratio is not None:
+        if rollout_is_topk_candidate_threshold is not None and entropy is None:
+            raise ValueError(
+                "rollout_is_topk_candidate_threshold requires token entropy for top-k selection. "
+                "Ensure the trainer passes 'entropy' into rollout correction."
+            )
+        topk_mask = compute_topk_selection_mask(
+            log_ratio,
+            response_mask,
+            rollout_is_topk_ratio,
+            entropy=entropy,
+            candidate_is_threshold=rollout_is_topk_candidate_threshold,
+        )
+        modified_response_mask = modified_response_mask * topk_mask
+        metrics["rollout_is_topk_kept_fraction"] = verl_F.masked_mean(topk_mask, response_mask).item()
+        metrics["rollout_is_topk_masked_fraction"] = verl_F.masked_mean(1.0 - topk_mask, response_mask).item()
+        if rollout_is_topk_candidate_threshold is not None:
+            upper, lower = _parse_rollout_is_threshold(rollout_is_topk_candidate_threshold)
+            raw_weights = torch.exp(torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND))
+            candidate_mask = ((raw_weights >= lower) & (raw_weights <= upper)) & response_mask.bool()
+            metrics["rollout_is_topk_candidate_fraction"] = verl_F.masked_mean(
+                candidate_mask.float(), response_mask
+            ).item()
 
     # Step 4: Compute off-policy metrics (KL, PPL, χ², etc.)
     offpolicy_metrics: dict[str, float] = compute_offpolicy_metrics(
@@ -1042,6 +1151,9 @@ def compute_rollout_correction_and_add_to_batch(
     rollout_is_batch_normalize = rollout_corr_config.get("rollout_is_batch_normalize", False)
     rollout_rs = rollout_corr_config.get("rollout_rs", None)
     rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
+    rollout_is_topk_ratio = rollout_corr_config.get("rollout_is_topk_ratio", None)
+    rollout_is_topk_candidate_threshold = rollout_corr_config.get("rollout_is_topk_candidate_threshold", None)
+    entropy = batch.batch.get("entropy", None)
 
     # Compute IS weights and get modified response_mask
     rollout_is_weights, modified_response_mask, rollout_corr_metrics = compute_rollout_correction_and_rejection_mask(
@@ -1053,6 +1165,9 @@ def compute_rollout_correction_and_add_to_batch(
         rollout_is_batch_normalize=rollout_is_batch_normalize,
         rollout_rs=rollout_rs,
         rollout_rs_threshold=rollout_rs_threshold,
+        rollout_is_topk_ratio=rollout_is_topk_ratio,
+        rollout_is_topk_candidate_threshold=rollout_is_topk_candidate_threshold,
+        entropy=entropy,
     )
 
     # ALWAYS update response_mask with rejection applied

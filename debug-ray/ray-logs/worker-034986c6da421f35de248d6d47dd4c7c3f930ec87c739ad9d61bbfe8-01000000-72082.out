@@ -1,0 +1,12 @@
+:job_id:01000000
+INFO 09-15 20:54:58 [__init__.py:216] Automatically detected platform cuda.
+:actor_name:SGLangHttpServer
+INFO 09-15 20:55:12 [__init__.py:216] Automatically detected platform cuda.
+SGLang http server: rollout_mode=<RolloutMode.HYBRID: 'hybrid'>, replica_rank=5, node_rank=0, nnodes=1, cuda_visible_devices='5', role=null
+INFO 09-15 20:57:08 [__init__.py:216] Automatically detected platform cuda.
+INFO 09-15 20:57:08 [__init__.py:216] Automatically detected platform cuda.
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+INFO 09-15 20:57:20 [__init__.py:216] Automatically detected platform cuda.
+INFO 09-15 20:57:21 [__init__.py:216] Automatically detected platform cuda.

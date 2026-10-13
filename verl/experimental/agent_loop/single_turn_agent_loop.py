@@ -40,6 +40,21 @@ class SingleTurnAgentLoop(AgentLoopBase):
         priority = int(priority)
         messages = list(kwargs["raw_prompt"])
 
+        # Local rollback of a previously generated trajectory (train_mismatch_gate): the
+        # trainer re-dispatches a dirty group with per-session seeds so each session resumes
+        # from its kept prefix instead of regenerating from scratch. The seeds arrive as
+        # per-uid lists indexed by the session_id the worker assigned; a session without a
+        # rollback point is re-inserted verbatim (seed_is_complete).
+        seed_token_ids = kwargs.pop("seed_token_ids", None)
+        seed_log_probs = kwargs.pop("seed_log_probs", None)
+        seed_is_complete = kwargs.pop("seed_is_complete", None)
+        seed_global_steps = kwargs.get("global_steps", None)
+        if seed_token_ids is not None:
+            session_id = int(kwargs.get("session_id", 0))
+            seed_token_ids = seed_token_ids[session_id]
+            seed_log_probs = seed_log_probs[session_id] if seed_log_probs is not None else None
+            seed_is_complete = bool(seed_is_complete[session_id]) if seed_is_complete is not None else False
+
         # 1. extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
         images = multi_modal_data.get("images")
@@ -61,6 +76,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
 
         # 3. generate sequences
+        # ``uid_session`` identifies this trajectory to the precision-escalation
+        # control layer, which counts repeated rollbacks per session and escalates
+        # the whole uid group once one session trips repeatedly.
+        uid = kwargs.get("uid")
+        escalation_key = f"{uid}_{kwargs.get('session_id', 0)}" if uid is not None else None
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
@@ -73,6 +93,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 video_data=videos,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
+                escalation_key=escalation_key,
+                seed_token_ids=seed_token_ids,
+                seed_log_probs=seed_log_probs,
+                seed_is_complete=seed_is_complete,
+                seed_global_steps=seed_global_steps,
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1

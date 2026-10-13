@@ -283,7 +283,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         ):
             # update
             output_lst = []
-            total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            # Ceil so the lr scheduler fires on the actual last mini-batch even when
+            # the batch leaves a ragged tail (a gate-screened batch whose clean count
+            # is not a multiple of the mini-batch size). For divisible batches this
+            # equals the old floor count exactly.
+            total_num_iterations = -(-data.shape[0] // mini_batch_size_per_gpu) * epochs
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
@@ -716,6 +720,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_rollout_precision(self, precision: str) -> None:
+        """Repoint the colocated rollout adapter at a restarted engine of ``precision``.
+
+        The precision switch kills the SGLang server actors and relaunches them with
+        a different quantization, so the adapter's cached HTTP engine and server-actor
+        handle are stale -- dropping them makes the next ``update_weights`` re-resolve
+        the new actor. ``quantization`` is also flipped so the weight sync matches the
+        new engine (bf16 tensors into a bf16 server, fp8 quantization into an fp8 one).
+        """
+        if self.rollout is None:
+            return
+        quantization = None if precision == "bf16" else "fp8"
+        object.__setattr__(self.rollout.config, "quantization", quantization)
+        if hasattr(self.rollout, "_engine"):
+            self.rollout._engine = None
+        if hasattr(self.rollout, "server_actor"):
+            self.rollout.server_actor = None
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.
@@ -795,9 +818,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
 
-        # 4. resume kv_cache
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
+        # 4. resume kv_cache (skipped when the KV cache is resident — e.g. fp8 KV,
+        #    which is never released, so there is nothing to resume)
+        if self.config.rollout.free_cache_engine and not self.rollout.kv_cache_resident:
+            try:
+                await self.rollout.resume(tags=["kv_cache"])
+            except Exception:
+                # The scheduler now fails fast on a resume error instead of
+                # killing its event loop, so a transient failure (e.g. momentary
+                # GPU memory pressure from the weight-sync staging tensors) can be
+                # recovered: reclaim trainer memory and retry once before raising.
+                logger.exception("kv_cache resume failed; reclaiming trainer memory and retrying")
+                aggressive_empty_cache(force_sync=True)
+                await self.rollout.resume(tags=["kv_cache"])
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True

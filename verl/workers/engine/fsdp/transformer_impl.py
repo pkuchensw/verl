@@ -71,7 +71,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
-from verl.workers.utils.padding import build_attention_mask_from_nested
+from verl.workers.utils.padding import build_attention_mask_from_nested, response_field_to_rmpad_label_positions
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
@@ -255,6 +255,7 @@ class FSDPEngine(BaseEngine):
                     torch_dtype=torch_dtype,
                     config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
+                    low_cpu_mem_usage=True,
                 )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
@@ -1279,6 +1280,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits_rmpad = logits_rmpad / temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
 
                 log_probs = None
+                sc_topk_logprob_rmpad = None
 
                 if calculate_sum_pi_squared:
                     sum_pi_squared_rmpad = verl_F.calculate_sum_pi_squared_from_logits(logits_rmpad)
@@ -1322,6 +1324,27 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         inplace_backward=inplace_backward,
                     )
 
+                # Score Centering: score the sampler's top-k ids under the training
+                # distribution, normalized over the full vocabulary. The ids sit in
+                # ``sc_topk_ids`` (response-length padded, -1 = invalid slot); they are
+                # scattered to the same rmpad rows ``no_padding_2_padding`` reads so the
+                # gathered logprobs line up with the response axis. Gradient flows through
+                # ``logits_rmpad`` (the task requires p_head to keep gradient).
+                sc_topk_ids = micro_batch.get("sc_topk_ids", None)
+                # Only build the centered-score candidates when a loss will consume them.
+                # Forward-only passes (old_log_prob / ref_log_prob) call with
+                # loss_function=None; scoring the top-k there would run an extra full-vocab
+                # logsumexp per token and materialize a [total_nnz, K] tensor nobody reads.
+                if sc_topk_ids is not None and logits_processor_func is not None:
+                    if self.use_ulysses_sp:
+                        raise NotImplementedError(
+                            "score_centering does not support ulysses sequence parallelism yet"
+                        )
+                    ids_rmpad = response_field_to_rmpad_label_positions(
+                        sc_topk_ids, micro_batch, total_nnz=logits_rmpad.shape[0]
+                    )
+                    sc_topk_logprob_rmpad = verl_F.logprobs_at_ids_from_logits(logits_rmpad, ids_rmpad)
+
             # gather log_prob if sp > 1
             if self.use_ulysses_sp:
                 pad_size = output_args["pad_size"]
@@ -1358,6 +1381,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
                 if calculate_sum_pi_squared:
                     sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+                if sc_topk_logprob_rmpad is not None:
+                    model_output["sc_topk_logprob"] = torch.nested.nested_tensor_from_jagged(
+                        sc_topk_logprob_rmpad, cu_seqlens
+                    )
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 

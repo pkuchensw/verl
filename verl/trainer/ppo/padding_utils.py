@@ -111,7 +111,23 @@ def construct_minimal_padding_template(
         loss_mask=response_mask,
         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+        # Trainer-written per-token writebacks must be aligned to the minimal 1-token
+        # response too. If left at the source sample's length, a padding sample in the
+        # mini-batch widens old_log_probs past the forward batch's response width and
+        # ppo_loss crashes at `log_prob - old_log_prob`.
+        old_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+        log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+        entropy=torch.zeros_like(response_mask, dtype=torch.float32),
     )
+    # Score Centering: the copied template would keep the source sample's [response_len, K]
+    # top-k, which is longer than this sample's 1-token response (same failure mode as
+    # old_log_probs above). Resize to [1, K] with invalid slots.
+    sc_ids = template_sample.get("sc_topk_ids")
+    if sc_ids is not None:
+        k = sc_ids.shape[-1]
+        template_sample["sc_topk_ids"] = torch.full((1, k), -1, dtype=sc_ids.dtype)
+        sc_lps = template_sample.get("sc_topk_logprobs")
+        template_sample["sc_topk_logprobs"] = torch.zeros((1, k), dtype=sc_lps.dtype)
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

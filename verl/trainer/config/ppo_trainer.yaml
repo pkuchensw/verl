@@ -127,6 +127,132 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Mismatch-aware partial rollout truncation (Async Partial Rollout only)
+  partial_rollout_mismatch_truncation:
+
+    # Whether to enable mismatch-aware partial rollout truncation at weight sync
+    enable: false
+
+    # |log_ratio| threshold above which a token is treated as a high mismatch.
+    # Calibrated 2026-08-14 on 200 DAPO-Math prefixes (9600 tokens): fp8-vs-bf16
+    # engine noise per-token max = 0.97 (p99.9 = 0.34), so tau >= 1.5 has ~0
+    # false-positive rate. tau = 2.0 keeps 2x margin over the noise tail while
+    # still catching genuinely drifted prefixes (22% of a math-vs-base anchor set).
+    log_ratio_threshold: 2.0
+
+    # Rollback window used to derive b = max(t* - rollback_window, 0)
+    rollback_window: 32
+
+  # Mismatch-driven precision escalation (Async colocate only)
+  # A prompt group that trips the truncation / mismatch-gate mechanisms
+  # num_rollbacks_trigger times is judged to be blocked by the low-precision
+  # rollout engine itself rather than by model staleness. Its entire prior
+  # inference is discarded, it is parked in a buffer, and once batch_size groups
+  # accumulate the rollout engine is switched to target_precision, the batch is
+  # regenerated on it, and the engine is switched back. Nothing else runs during
+  # the switch (the whole engine changes precision), so this is a serialized,
+  # blocking operation. Disabled by default.
+  #
+  # Escalation is a ONE-SHOT test per group: a uid that has been regenerated at
+  # target_precision is never escalated again. If the group still trips after a
+  # bf16 regeneration, engine precision was not its problem and swapping the
+  # engine for it again would cycle the stop/start forever at the
+  # num_rollbacks_trigger period. This also bounds the total number of switches
+  # by the number of distinct stuck groups (divided by batch_size).
+  mismatch_precision_escalation:
+
+    # Whether to enable mismatch-driven precision escalation
+    enable: false
+
+    # How a repeatedly-tripped group is escalated:
+    #   switch -> buffer the group and, once batch_size accumulate, switch the
+    #             rollout engine to target_precision, regenerate, and switch back.
+    #   drop   -> do NOT touch the engine: the sampler clears the triggered group
+    #             (prompt + trajectories) before selection and refills its slot, so
+    #             it is never trained on. Cheaper (no drain/restart, not blocking)
+    #             but discards the group instead of rescuing it; batch_size and
+    #             target_precision are unused.
+    strategy: switch
+
+    # Rollbacks a trajectory may accumulate, since its last regeneration, before
+    # its uid is escalated. At 3 it has survived two in-place rollbacks and
+    # tripped a third time, filtering out the one-off rollbacks that
+    # truncation/gate handle fine.
+    num_rollbacks_trigger: 3
+
+    # Escalated groups to accumulate before switching the engine and regenerating.
+    # Counted in prompt groups (each carrying rollout.n trajectories, so 32 groups
+    # is 256 sequences at n=8). Deliberately far below data.train_batch_size: a
+    # group only reaches the buffer after tripping num_rollbacks_trigger times, so
+    # a small batch keeps a handful of chronically-stuck groups from waiting
+    # forever for a full training batch that never fills.
+    batch_size: 32
+
+    # Engine precision the escalated batch runs on. Currently only "bf16".
+    target_precision: bf16
+
+    # Soft cap on the escalation buffer (0 = derive from batch_size).
+    max_buffer: 0
+
+    # Hard cap on tracked rollback keys (0 = derive from batch_size); oldest first.
+    max_tracked: 0
+
+  # Score Centering (arXiv 2609.20807v1, Sections 4 + Appendix A)
+  # Replace the REINFORCE score log p(a) of the sampled token with the centered score
+  #   log p(a) - E_{v~q}[log p(v)]
+  # where p is the training next-token distribution and q the rollout engine's sampling
+  # distribution. Centering removes the E_q[grad log p] component of the policy gradient:
+  # under p == q the centering correction has zero gradient and SC degenerates to vanilla
+  # PG, while for p != q (low-precision / stale rollout engine) it removes the systematic
+  # drift that the mismatch injects. Independent switch; off => original training path.
+  # Requires the rollout engine to record the sampler top-k (token ids + q logprobs) and
+  # the training engine to score those ids with full-vocabulary normalization.
+  score_centering:
+
+    # Whether to enable Score Centering
+    enable: False
+
+    # Number of sampler top-k candidates recorded per generated position
+    topk: 8
+
+    # Importance-weighting mode for the sampled token (combined SC + IS):
+    #   none -> pure SC (no IS)
+    #   tis  -> truncated IS: clamp(p(a)/q(a), max=is_high) on the sampled term
+    #   mis  -> masked IS: p(a)/q(a) inside [is_low, is_high] else 0 (sampled term only;
+    #           the centering correction is never masked)
+    is_mode: none
+
+    # Lower/upper bounds for the mis mode
+    is_low: 0.5
+    is_high: 5.0
+
+    # Coefficient form of the centering correction:
+    #   centered     -> q_head - rho * p_head (tail-aware, rho = q_tail / p_tail)
+    #   sampled_only -> q_head (drop the tail reconstruction; ablation only)
+    coefficient_mode: centered
+
+  # Training-time mismatch screening (Async + TransferQueue only)
+  # Oversample a few extra prompt groups per step, compute the sequence-level sample
+  # LLR = sum_t mask_t * (pi_k_logprob - rollout_logprob) for every sampled trajectory,
+  # and re-dispatch the whole uid group of any trajectory with |LLR| > log_ratio_threshold.
+  # Dropped groups are regenerated by the current model and re-screened when sampled
+  # again, so every sample reaching the actor update has been screened at least once.
+  # The trained batch size then varies slightly (oversample headroom minus dropped dirty
+  # groups). Dirty groups are force-accepted after max_force_accept_regens regenerations
+  # to avoid starving training on a persistently high-mismatch prompt.
+  # pi_k logprobs are reused from _compute_old_log_prob when the decoupled path recomputes
+  # them (is_mode=tis/mis); in bypass mode (is_mode=none) the gate recomputes pi_k itself
+  # with one extra training-engine forward per step.
+  train_mismatch_gate:
+    enable: true
+    log_ratio_threshold: 5.0
+    rollback_window: 32
+    oversample: 8
+    # Soft floor for relative top-K re-sampling: groups with per-token mismatch below
+    # this are never re-generated even if they rank in the top-K (engine-noise floor ~1.0).
+    min_llr: 1.5
+    max_force_accept_regens: 3
+
 # config for the trainer
 trainer:
 

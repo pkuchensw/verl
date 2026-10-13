@@ -68,6 +68,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        # Score Centering: request the sampler's top-k token ids + q logprobs per position.
+        sc_topk = int(getattr(config, "score_centering_topk", 0) or 0)
+        if sc_topk > 0:
+            sampling_params["score_centering_topk"] = sc_topk
 
         # override sampling params for validation
         if validate:
@@ -152,6 +156,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
         uid, session_id = kwargs["uid"], kwargs["session_id"]
+        # Per-request local-rollback control signals (train_mismatch_gate) are consumed by
+        # the agent loop; they must not be persisted onto the trajectory (full-response seed
+        # lists would bloat tq memory) or leaked into a later re-dispatch.
+        for key in ("seed_token_ids", "seed_log_probs", "seed_is_complete"):
+            kwargs.pop(key, None)
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
@@ -192,6 +201,38 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
+            # Fail-closed write guard: responses / response_mask / rollout_log_probs
+            # must agree in length. A client-side partial-rollout race can leave a
+            # trajectory whose rollout_log_probs is longer than its responses; once
+            # in tq that desync reaches ppo_loss and crashes `log_prob - old_log_prob`.
+            # The response is authoritative: align rollout_log_probs to it on the raw
+            # per-key values here (before any tq stacking can pad a per-trajectory
+            # length) and surface a diagnostic. response_mask tracks responses by
+            # construction; trim it if it somehow drifted longer.
+            resp_t = field["responses"]
+            mask_t = field["response_mask"]
+            lp_t = field.get("rollout_log_probs", None)
+            resp_n = resp_t.size(0)
+            if lp_t is not None and lp_t.size(0) != resp_n:
+                logger.error(
+                    "[tq-write-guard] uid=%s session=%s idx=%d length mismatch: "
+                    "responses=%d response_mask=%d rollout_log_probs=%d; aligning log_probs to %d",
+                    uid,
+                    session_id,
+                    i,
+                    resp_n,
+                    mask_t.size(0),
+                    lp_t.size(0),
+                    resp_n,
+                )
+                if lp_t.size(0) > resp_n:
+                    field["rollout_log_probs"] = lp_t[:resp_n]
+                else:
+                    field["rollout_log_probs"] = torch.cat(
+                        [lp_t, torch.zeros(resp_n - lp_t.size(0), dtype=lp_t.dtype, device=lp_t.device)]
+                    )
+            if mask_t.size(0) != resp_n:
+                field["response_mask"] = mask_t[:resp_n]
             field.update(kwargs)
             # do not store raw image/video
             field.pop("multi_modal_data", None)
